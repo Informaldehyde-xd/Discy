@@ -1,7 +1,10 @@
 package com.example.discconverter
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -12,200 +15,189 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
 class MainActivity : ComponentActivity() {
+
+    private var progressState = mutableFloatStateOf(0f)
+    private var isConvertingState = mutableStateOf(false)
+    private var statusMessageState = mutableStateOf("Select a file to convert")
+
+    private val conversionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ConversionService.ACTION_CONVERSION_PROGRESS -> {
+                    val progress = intent.getFloatExtra(ConversionService.EXTRA_PROGRESS, 0f)
+                    progressState.floatValue = progress
+                    statusMessageState.value = "Converting: ${(progress * 100).toInt()}%"
+                }
+                ConversionService.ACTION_CONVERSION_COMPLETE -> {
+                    isConvertingState.value = false
+                    progressState.floatValue = 1f
+                    statusMessageState.value = "Conversion completed successfully!"
+                    Toast.makeText(this@MainActivity, "Conversion Done!", Toast.LENGTH_SHORT).show()
+                }
+                ConversionService.ACTION_CONVERSION_ERROR -> {
+                    isConvertingState.value = false
+                    val error = intent.getStringExtra(ConversionService.EXTRA_ERROR_MESSAGE) ?: "Unknown error"
+                    statusMessageState.value = "Error: $error"
+                    Toast.makeText(this@MainActivity, "Failed: $error", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+        super.onCreate()
+
+        val filter = IntentFilter().apply {
+            addAction(ConversionService.ACTION_CONVERSION_PROGRESS)
+            addAction(ConversionService.ACTION_CONVERSION_COMPLETE)
+            addAction(ConversionService.ACTION_CONVERSION_ERROR)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(conversionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(conversionReceiver, filter)
+        }
+
         setContent {
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    BatchConverterScreen()
+                    ConverterScreen(
+                        isConverting = isConvertingState.value,
+                        progress = progressState.floatValue,
+                        statusMessage = statusMessageState.value,
+                        onStartConversion = { mode, inputUri, outputUri ->
+                            requestNotificationPermissionAndStart(mode, inputUri, outputUri)
+                        }
+                    )
                 }
             }
         }
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(conversionReceiver)
+    }
+
+    private fun requestNotificationPermissionAndStart(mode: ConversionType, inputUri: Uri, outputUri: Uri) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
+        startConversionService(mode, inputUri, outputUri)
+    }
+
+    private fun startConversionService(mode: ConversionType, inputUri: Uri, outputUri: Uri) {
+        isConvertingState.value = true
+        progressState.floatValue = 0f
+        statusMessageState.value = "Starting conversion..."
+
+        val intent = Intent(this, ConversionService::class.java).apply {
+            putExtra(ConversionService.EXTRA_INPUT_URI, inputUri)
+            putExtra(ConversionService.EXTRA_OUTPUT_URI, outputUri)
+            putExtra(ConversionService.EXTRA_CONVERSION_TYPE, mode.name)
+        }
+        ContextCompat.startForegroundService(this, intent)
+    }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun BatchConverterScreen() {
-    val context = LocalContext.current
+fun ConverterScreen(
+    isConverting: Boolean,
+    progress: Float,
+    statusMessage: String,
+    onStartConversion: (ConversionType, Uri, Uri) -> Unit
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var selectedMode by remember { mutableStateOf(ConversionType.BIN_TO_ISO) }
-    var inputUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var inputUri by remember { mutableStateOf<Uri?>(null) }
+    var inputFileName by remember { mutableStateOf("") }
 
-    // Collect foreground service state
-    val state by ConversionService.conversionState.collectAsState()
-
-    // Permission launcher for Notifications (Android 13+)
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (!isGranted) {
-            Toast.makeText(context, "Notification permission required for background progress", Toast.LENGTH_SHORT).show()
+    val createDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("*/*")
+    ) { outputUri ->
+        if (outputUri != null && inputUri != null) {
+            onStartConversion(selectedMode, inputUri!!, outputUri)
         }
     }
 
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-    }
-
-    // Directory Picker Launcher
-    val dirPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { outputDirUri ->
-        if (outputDirUri != null && inputUris.isNotEmpty()) {
-            val intent = Intent(context, ConversionService::class.java).apply {
-                action = ConversionService.ACTION_START_BATCH
-                putParcelableArrayListExtra(ConversionService.EXTRA_INPUT_URIS, ArrayList(inputUris))
-                putExtra(ConversionService.EXTRA_OUTPUT_DIR_URI, outputDirUri)
-                putExtra(ConversionService.EXTRA_MODE, selectedMode.name)
-            }
-            ContextCompat.startForegroundService(context, intent)
-            inputUris = emptyList()
-        }
-    }
-
-    // Multiple Files Picker Launcher
-    val multipleFilesLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            inputUris = uris
+    val openDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            inputUri = uri
+            inputFileName = DiscConverter.getFileName(context, uri)
         }
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(20.dp),
+            .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.Center
     ) {
-        Text("Batch Disc Converter", style = MaterialTheme.typography.headlineMedium)
+        Text(text = "Disc Converter", style = MaterialTheme.typography.headlineMedium)
+        Spacer(modifier = Modifier.height(24.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(
-                selected = selectedMode == ConversionType.BIN_TO_ISO,
-                onClick = { if (!state.isRunning) { selectedMode = ConversionType.BIN_TO_ISO; inputUris = emptyList() } },
-                label = { Text("BIN → ISO") }
-            )
-            FilterChip(
-                selected = selectedMode == ConversionType.ISO_TO_ZSO,
-                onClick = { if (!state.isRunning) { selectedMode = ConversionType.ISO_TO_ZSO; inputUris = emptyList() } },
-                label = { Text("ISO → ZSO") }
-            )
-            FilterChip(
-                selected = selectedMode == ConversionType.ZSO_TO_ISO,
-                onClick = { if (!state.isRunning) { selectedMode = ConversionType.ZSO_TO_ISO; inputUris = emptyList() } },
-                label = { Text("ZSO → ISO") }
-            )
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(
-                onClick = {
-                    val mimeTypes = arrayOf("application/octet-stream", "application/x-iso9660-image", "*/*")
-                    multipleFilesLauncher.launch(mimeTypes)
-                },
-                enabled = !state.isRunning
-            ) {
-                Text(if (inputUris.isEmpty()) "Select Files" else "Add / Change Files")
-            }
-
-            if (inputUris.isNotEmpty()) {
-                OutlinedButton(
-                    onClick = { inputUris = emptyList() },
-                    enabled = !state.isRunning
-                ) {
-                    Text("Clear")
-                }
+            ConversionType.entries.forEach { mode ->
+                FilterChip(
+                    selected = selectedMode == mode,
+                    onClick = { selectedMode = mode },
+                    label = { Text(mode.name.replace('_', ' ')) }
+                )
             }
         }
 
-        if (inputUris.isNotEmpty()) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        text = "Selected (${inputUris.size} files):",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        items(inputUris) { uri ->
-                            val name = DiscConverter.getFileName(context, uri)
-                            Text(text = "• $name", style = MaterialTheme.typography.bodySmall, maxLines = 1)
-                        }
-                    }
-                }
-            }
+        Spacer(modifier = Modifier.height(24.dp))
 
-            Button(
-                onClick = { dirPickerLauncher.launch(null) },
-                enabled = !state.isRunning,
+        Button(
+            onClick = { openDocumentLauncher.launch(arrayOf("*/*")) },
+            enabled = !isConverting
+        ) {
+            Text("Select Source File")
+        }
+
+        if (inputFileName.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(text = "Selected: $inputFileName", style = MaterialTheme.typography.bodyMedium)
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(
+            onClick = {
+                val defaultOutput = DiscConverter.deriveOutputName(inputFileName, selectedMode)
+                createDocumentLauncher.launch(defaultOutput)
+            },
+            enabled = !isConverting && inputUri != null
+        ) {
+            Text("Convert & Save As...")
+        }
+
+        Spacer(modifier = Modifier.height(32.dp))
+
+        if (isConverting || progress > 0f) {
+            LinearProgressIndicator(
+                progress = { progress },
                 modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Select Destination Folder & Start")
-            }
-        } else if (!state.isRunning) {
-            Spacer(modifier = Modifier.weight(1f))
-            Text(
-                "No files selected.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(12.dp))
         }
 
-        // Live status from Foreground Service
-        if (state.isRunning) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = "Converting file ${state.currentFileIndex} of ${state.totalFiles}",
-                        style = MaterialTheme.typography.titleSmall
-                    )
-                    Text(
-                        text = state.currentFileName,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1
-                    )
-                    LinearProgressIndicator(
-                        progress = { state.fileProgress },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    Text(
-                        text = "${(state.fileProgress * 100).toInt()}%",
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.align(Alignment.End)
-                    )
-                }
-            }
-        }
+        Text(text = statusMessage, style = MaterialTheme.typography.bodyLarge)
     }
 }
