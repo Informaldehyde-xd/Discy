@@ -53,18 +53,20 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate()
+        super.onCreate(savedInstanceState)
 
         val filter = IntentFilter().apply {
             addAction(ConversionService.ACTION_CONVERSION_PROGRESS)
             addAction(ConversionService.ACTION_CONVERSION_COMPLETE)
             addAction(ConversionService.ACTION_CONVERSION_ERROR)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(conversionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(conversionReceiver, filter)
-        }
+
+        ContextCompat.registerReceiver(
+            this,
+            conversionReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
 
         setContent {
             MaterialTheme {
