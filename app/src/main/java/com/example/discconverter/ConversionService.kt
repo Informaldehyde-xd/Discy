@@ -53,11 +53,19 @@ class ConversionService : Service() {
 
             serviceScope.launch {
                 try {
+                    var lastUpdatePercent = -1
+
                     val progressCallback: (Float) -> Unit = { progress ->
-                        updateNotification((progress * 100).toInt())
-                        sendBroadcast(Intent(ACTION_CONVERSION_PROGRESS).apply {
-                            putExtra(EXTRA_PROGRESS, progress)
-                        })
+                        val currentPercent = (progress * 100).toInt()
+                        
+                        // ONLY update the system if the percentage has actually increased
+                        if (currentPercent > lastUpdatePercent) {
+                            lastUpdatePercent = currentPercent
+                            updateNotification(currentPercent)
+                            sendBroadcast(Intent(ACTION_CONVERSION_PROGRESS).apply {
+                                putExtra(EXTRA_PROGRESS, progress)
+                            })
+                        }
                     }
 
                     when (type) {
@@ -123,7 +131,7 @@ class ConversionService : Service() {
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setProgress(100, progressPercent, false)
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
+            .setOnlyAlertOnce(true) // Prevents the notification from vibrating/dinging repeatedly
             .build()
     }
 }
