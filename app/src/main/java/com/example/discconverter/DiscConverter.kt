@@ -55,8 +55,9 @@ object DiscConverter {
         val sectors = totalSize / BIN_SECTOR_SIZE
         var processedSectors = 0L
 
-        contentResolver.openInputStream(inputUri)?.use { input ->
-            contentResolver.openOutputStream(outputUri)?.use { output ->
+        // Added 64KB buffering for massive read/write speed improvements
+        contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { input ->
+            contentResolver.openOutputStream(outputUri)?.buffered(65536)?.use { output ->
                 val buffer = ByteArray(BIN_SECTOR_SIZE)
                 while (input.read(buffer) == BIN_SECTOR_SIZE) {
                     val mode = buffer[15].toInt()
@@ -64,12 +65,14 @@ object DiscConverter {
                     output.write(buffer, offset, DEFAULT_BLOCK_SIZE)
 
                     processedSectors++
-                    if (sectors > 0) {
+                    // Throttle callback updates to every 1000 sectors (~2MB) to prevent thread blocking
+                    if (sectors > 0 && processedSectors % 1000L == 0L) {
                         onProgress(processedSectors.toFloat() / sectors.toFloat())
                     }
                 }
             }
         }
+        onProgress(1f) // Ensure 100% hits at completion
     }
 
     suspend fun isoToZso(
@@ -99,7 +102,8 @@ object DiscConverter {
             FileOutputStream(pfd.fileDescriptor).use { output ->
                 output.write(ByteArray(currentOffset))
 
-                contentResolver.openInputStream(inputUri)?.use { input ->
+                // Added 64KB buffering to the input
+                contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { input ->
                     val rawBuffer = ByteArray(DEFAULT_BLOCK_SIZE)
                     val compressBuffer = ByteArray(DEFAULT_BLOCK_SIZE * 2)
 
@@ -124,7 +128,10 @@ object DiscConverter {
                             indexTable[i + 1] = currentOffset
                         }
 
-                        onProgress((i + 1).toFloat() / totalBlocks.toFloat())
+                        // Throttle updates
+                        if (i % 1000 == 0 || i == totalBlocks - 1) {
+                            onProgress((i + 1).toFloat() / totalBlocks.toFloat())
+                        }
                     }
                 }
                 deflater.end()
@@ -185,7 +192,8 @@ object DiscConverter {
                 IntArray(totalBlocks + 1) { getInt() }
             }
 
-            contentResolver.openOutputStream(outputUri)?.use { output ->
+            // Buffer the output
+            contentResolver.openOutputStream(outputUri)?.buffered(65536)?.use { output ->
                 val inflater = Inflater()
 
                 for (i in 0 until totalBlocks) {
@@ -210,7 +218,10 @@ object DiscConverter {
                         output.write(decompressed)
                     }
 
-                    onProgress((i + 1).toFloat() / totalBlocks.toFloat())
+                    // Throttle updates
+                    if (i % 1000 == 0 || i == totalBlocks - 1) {
+                        onProgress((i + 1).toFloat() / totalBlocks.toFloat())
+                    }
                 }
                 inflater.end()
             }
