@@ -9,13 +9,14 @@ import java.nio.ByteOrder
 import java.util.zip.Deflater
 import java.util.zip.Inflater
 
+enum class ConversionType { BIN_TO_ISO, ISO_TO_ZSO, ZSO_TO_ISO }
+
 object DiscConverter {
 
     private const val DEFAULT_BLOCK_SIZE = 2048
     private const val BIN_SECTOR_SIZE = 2352
     private val ZSO_MAGIC = byteArrayOf('Z'.code.toByte(), 'S'.code.toByte(), 'O'.code.toByte(), 0x01)
 
-    /** Helper to extract original filename from Storage Access Framework Uri */
     fun getFileName(context: Context, uri: Uri): String {
         var name = "unknown_file"
         context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
@@ -27,7 +28,6 @@ object DiscConverter {
         return name
     }
 
-    /** Derives output filename based on conversion mode */
     fun deriveOutputName(inputName: String, mode: ConversionType): String {
         val baseName = inputName.substringBeforeLast('.')
         return when (mode) {
@@ -37,7 +37,6 @@ object DiscConverter {
         }
     }
 
-    /** Converts a 2352-byte sector RAW BIN image to a standard 2048-byte sector ISO */
     suspend fun binToIso(
         context: Context,
         inputUri: Uri,
@@ -69,10 +68,6 @@ object DiscConverter {
         }
     }
 
-    /**
-     * Compresses an ISO file into a ZSO file.
-     * Streams data directly to disk without loading entire images into RAM.
-     */
     suspend fun isoToZso(
         context: Context,
         inputUri: Uri,
@@ -93,16 +88,13 @@ object DiscConverter {
 
         val deflater = Deflater(compressionLevel)
 
-        // Open in "rw" mode to allow seeking back to write the header & index table later
         val outFd = contentResolver.openFileDescriptor(outputUri, "rw")
             ?: throw IllegalStateException("Cannot open output stream in read-write mode")
 
         outFd.use { pfd ->
             FileOutputStream(pfd.fileDescriptor).use { output ->
-                // 1. Write placeholder space for header and index table
                 output.write(ByteArray(currentOffset))
 
-                // 2. Stream compressed blocks directly to storage
                 contentResolver.openInputStream(inputUri)?.use { input ->
                     val rawBuffer = ByteArray(DEFAULT_BLOCK_SIZE)
                     val compressBuffer = ByteArray(DEFAULT_BLOCK_SIZE * 2)
@@ -133,7 +125,6 @@ object DiscConverter {
                 }
                 deflater.end()
 
-                // 3. Rewind to start of file and write actual header + populated index table
                 val channel = output.channel
                 channel.position(0)
 
@@ -159,7 +150,6 @@ object DiscConverter {
         }
     }
 
-    /** Decompresses a ZSO image back to an uncompressed ISO image */
     suspend fun zsoToIso(
         context: Context,
         inputUri: Uri,
