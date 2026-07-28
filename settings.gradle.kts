@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "DiscConverterAndroid"
+rootProject.name = "Discy"
 include(":app")
