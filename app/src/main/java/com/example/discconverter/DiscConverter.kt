@@ -9,7 +9,11 @@ import java.nio.ByteOrder
 import java.util.zip.Deflater
 import java.util.zip.Inflater
 
-enum class ConversionType { BIN_TO_ISO, ISO_TO_ZSO, ZSO_TO_ISO }
+enum class ConversionType {
+    BIN_TO_ISO,
+    ISO_TO_ZSO,
+    ZSO_TO_ISO
+}
 
 object DiscConverter {
 
