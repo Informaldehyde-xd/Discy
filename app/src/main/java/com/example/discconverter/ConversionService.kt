@@ -1,8 +1,8 @@
 package com.example.discconverter
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -10,185 +10,120 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
-import android.provider.DocumentsContract
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-
-data class BatchProgressState(
-    val isRunning: Boolean = false,
-    val currentFileIndex: Int = 0,
-    val totalFiles: Int = 0,
-    val currentFileName: String = "",
-    val fileProgress: Float = 0f,
-    val errorMessage: String? = null
-)
 
 class ConversionService : Service() {
 
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private lateinit var notificationManager: NotificationManager
+    private val serviceJob = Job()
+    private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
     companion object {
         const val CHANNEL_ID = "conversion_service_channel"
         const val NOTIFICATION_ID = 1001
 
-        const val ACTION_START_BATCH = "ACTION_START_BATCH"
-        const val EXTRA_INPUT_URIS = "EXTRA_INPUT_URIS"
-        const val EXTRA_OUTPUT_DIR_URI = "EXTRA_OUTPUT_DIR_URI"
-        const val EXTRA_MODE = "EXTRA_MODE"
+        const val EXTRA_INPUT_URI = "extra_input_uri"
+        const val EXTRA_OUTPUT_URI = "extra_output_uri"
+        const val EXTRA_CONVERSION_TYPE = "extra_conversion_type"
 
-        // Expose state to Compose UI
-        private val _conversionState = MutableStateFlow(BatchProgressState())
-        val conversionState: StateFlow<BatchProgressState> = _conversionState.asStateFlow()
+        const val ACTION_CONVERSION_PROGRESS = "com.example.discconverter.PROGRESS"
+        const val ACTION_CONVERSION_COMPLETE = "com.example.discconverter.COMPLETE"
+        const val ACTION_CONVERSION_ERROR = "com.example.discconverter.ERROR"
+
+        const val EXTRA_PROGRESS = "extra_progress"
+        const val EXTRA_ERROR_MESSAGE = "extra_error_message"
     }
 
     override fun onCreate() {
         super.onCreate()
-        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_START_BATCH) {
-            val inputUris = intent.getParcelableArrayListExtra<Uri>(EXTRA_INPUT_URIS) ?: emptyList()
-            val outputDirUri = intent.getParcelableExtra<Uri>(EXTRA_OUTPUT_DIR_URI)
-            val modeName = intent.getStringExtra(EXTRA_MODE) ?: ConversionType.BIN_TO_ISO.name
-            val mode = ConversionType.valueOf(modeName)
+        val inputUri: Uri? = intent?.getParcelableExtra(EXTRA_INPUT_URI)
+        val outputUri: Uri? = intent?.getParcelableExtra(EXTRA_OUTPUT_URI)
+        val typeName = intent?.getStringExtra(EXTRA_CONVERSION_TYPE)
+        val type = typeName?.let { runCatching { ConversionType.valueOf(it) }.getOrNull() }
 
-            if (inputUris.isNotEmpty() && outputDirUri != null) {
-                startForegroundServiceWithNotification()
-                runBatchTask(inputUris, outputDirUri, mode)
+        if (inputUri != null && outputUri != null && type != null) {
+            startForegroundServiceNotification()
+
+            serviceScope.launch {
+                try {
+                    val progressCallback: (Float) -> Unit = { progress ->
+                        updateNotification((progress * 100).toInt())
+                        sendBroadcast(Intent(ACTION_CONVERSION_PROGRESS).apply {
+                            putExtra(EXTRA_PROGRESS, progress)
+                        })
+                    }
+
+                    when (type) {
+                        ConversionType.BIN_TO_ISO -> DiscConverter.binToIso(this@ConversionService, inputUri, outputUri, progressCallback)
+                        ConversionType.ISO_TO_ZSO -> DiscConverter.isoToZso(this@ConversionService, inputUri, outputUri, onProgress = progressCallback)
+                        ConversionType.ZSO_TO_ISO -> DiscConverter.zsoToIso(this@ConversionService, inputUri, outputUri, progressCallback)
+                    }
+
+                    sendBroadcast(Intent(ACTION_CONVERSION_COMPLETE))
+                } catch (e: Exception) {
+                    sendBroadcast(Intent(ACTION_CONVERSION_ERROR).apply {
+                        putExtra(EXTRA_ERROR_MESSAGE, e.localizedMessage ?: "Unknown error occurred")
+                    })
+                } finally {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
+        } else {
+            stopSelf()
         }
+
         return START_NOT_STICKY
     }
 
-    private fun startForegroundServiceWithNotification() {
-        val notification = createNotification("Starting batch conversion...", 0, 100, 0)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceJob.cancel()
     }
-
-    private fun runBatchTask(inputUris: List<Uri>, outputDirUri: Uri, mode: ConversionType) {
-        serviceScope.launch {
-            _conversionState.value = BatchProgressState(isRunning = true, totalFiles = inputUris.size)
-
-            try {
-                inputUris.forEachIndexed { index, uri ->
-                    val originalName = DiscConverter.getFileName(this@ConversionService, uri)
-                    val targetName = DiscConverter.deriveOutputName(originalName, mode)
-
-                    _conversionState.value = _conversionState.value.copy(
-                        currentFileIndex = index + 1,
-                        currentFileName = originalName,
-                        fileProgress = 0f
-                    )
-
-                    updateNotification(
-                        title = "Converting (${index + 1}/${inputUris.size}): $originalName",
-                        progress = 0
-                    )
-
-                    val targetFileUri = DocumentsContract.createDocument(
-                        contentResolver,
-                        outputDirUri,
-                        "application/octet-stream",
-                        targetName
-                    )
-
-                    if (targetFileUri != null) {
-                        val progressCallback: (Float) -> Unit = { progress ->
-                            _conversionState.value = _conversionState.value.copy(fileProgress = progress)
-                            val pct = (progress * 100).toInt()
-                            if (pct % 5 == 0) { // Throttle notification updates
-                                updateNotification(
-                                    title = "Converting (${index + 1}/${inputUris.size}): $originalName",
-                                    progress = pct
-                                )
-                            }
-                        }
-
-                        when (mode) {
-                            ConversionType.BIN_TO_ISO -> DiscConverter.binToIso(
-                                this@ConversionService, uri, targetFileUri, progressCallback
-                            )
-                            ConversionType.ISO_TO_ZSO -> DiscConverter.isoToZso(
-                                this@ConversionService, uri, targetFileUri, 6, progressCallback
-                            )
-                            ConversionType.ZSO_TO_ISO -> DiscConverter.zsoToIso(
-                                this@ConversionService, uri, targetFileUri, progressCallback
-                            )
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                _conversionState.value = _conversionState.value.copy(errorMessage = e.message)
-            } finally {
-                _conversionState.value = BatchProgressState(isRunning = false)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
-        }
-    }
-
-    private fun updateNotification(title: String, progress: Int) {
-        val notification = createNotification(title, progress, 100, progress)
-        notificationManager.notify(NOTIFICATION_ID, notification)
-    }
-
-    private fun createNotification(
-        contentTitle: String,
-        progress: Int,
-        maxProgress: Int,
-        pct: Int
-    ) = NotificationCompat.Builder(this, CHANNEL_ID)
-        .setContentTitle("Disc Image Converter")
-        .setContentText(contentTitle)
-        .setSmallIcon(android.R.drawable.stat_sys_download)
-        .setOngoing(true)
-        .setProgress(maxProgress, progress, false)
-        .setSubText("$pct%")
-        .setPriority(NotificationCompat.PRIORITY_LOW)
-        .setContentIntent(
-            PendingIntent.getActivity(
-                this, 0,
-                Intent(this, MainActivity::class.java),
-                PendingIntent.FLAG_IMMUTABLE
-            )
-        )
-        .build()
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Disc Conversion Processing",
+                "Disc Conversion Service",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Shows progress during active file conversions."
-            }
-            notificationManager.createNotificationChannel(channel)
+            )
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        serviceScope.cancel()
+    private fun startForegroundServiceNotification() {
+        val notification = createNotification(0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private fun updateNotification(progressPercent: Int) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, createNotification(progressPercent))
+    }
+
+    private fun createNotification(progressPercent: Int): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Converting Disc Image...")
+            .setContentText("Progress: $progressPercent%")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setProgress(100, progressPercent, false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+    }
 }
