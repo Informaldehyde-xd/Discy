@@ -22,10 +22,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -199,7 +199,7 @@ fun ConverterScreen(
                             .border(1.dp, Color(0x26438CFF), RoundedCornerShape(12.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Rounded.PlayArrow, contentDescription = null, tint = Color(0xFF81ACFF), modifier = Modifier.size(20.dp))
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color(0xFF81ACFF), modifier = Modifier.size(20.dp))
                     }
                     Spacer(modifier = Modifier.width(12.dp))
                     Text(
@@ -315,7 +315,7 @@ fun ConverterScreen(
                                 Text("Select source file", color = Color(0xFFEAF2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
                                 Text(if (inputFileName.isEmpty()) "BIN, ISO, ZSO, CSO, or IMG" else inputFileName, color = Color(0xFF8EA3C6), fontSize = 12.sp, maxLines = 1)
                             }
-                            Icon(Icons.Default.ChevronRight, contentDescription = null, tint = Color(0xB3BFDBFE))
+                            Icon(Icons.Default.KeyboardArrowRight, contentDescription = null, tint = Color(0xB3BFDBFE))
                         }
                     }
 
@@ -363,7 +363,7 @@ fun ConverterScreen(
                             .padding(12.dp)
                             .fillMaxWidth()) {
                             Icon(
-                                imageVector = if (isError) Icons.Rounded.Warning else Icons.Default.Info,
+                                imageVector = if (isError) Icons.Default.Warning else Icons.Default.Info,
                                 contentDescription = null,
                                 tint = if (isError) Color(0xFFFF6B6B) else Color(0xFF83B0FF),
                                 modifier = Modifier.size(18.dp)
