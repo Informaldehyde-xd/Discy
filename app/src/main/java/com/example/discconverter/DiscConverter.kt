@@ -64,7 +64,6 @@ object DiscConverter {
                 
                 try {
                     while (true) {
-                        // readFully guarantees we get the exact sector size, or throws EOFException
                         input.readFully(buffer)
                         
                         val mode = buffer[15].toInt()
@@ -96,11 +95,22 @@ object DiscConverter {
         val totalBytes = fileDescriptor.statSize
         fileDescriptor.close()
 
+        // Calculate index shift for 2GB+ support
+        var indexShift = 0
+        while ((totalBytes shr indexShift) > 0x7FFFFFFF) {
+            indexShift++
+        }
+        val align = 1 shl indexShift
+
         val totalBlocks = ((totalBytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE).toInt()
         val indexTable = IntArray(totalBlocks + 1)
-        var currentOffset = 24 + (totalBlocks + 1) * 4
+        
+        var currentOffset = 24L + (totalBlocks + 1) * 4L
+        if (currentOffset % align != 0L) {
+            currentOffset += align - (currentOffset % align)
+        }
 
-        indexTable[0] = currentOffset
+        indexTable[0] = (currentOffset shr indexShift).toInt()
 
         val deflater = Deflater(compressionLevel)
 
@@ -109,14 +119,13 @@ object DiscConverter {
 
         outFd.use { pfd ->
             FileOutputStream(pfd.fileDescriptor).use { output ->
-                output.write(ByteArray(currentOffset))
+                output.write(ByteArray(currentOffset.toInt()))
 
                 contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { input ->
                     val rawBuffer = ByteArray(DEFAULT_BLOCK_SIZE)
                     val compressBuffer = ByteArray(DEFAULT_BLOCK_SIZE * 2)
 
                     for (i in 0 until totalBlocks) {
-                        // Safely read up to DEFAULT_BLOCK_SIZE
                         var bytesRead = 0
                         while (bytesRead < DEFAULT_BLOCK_SIZE) {
                             val r = input.read(rawBuffer, bytesRead, DEFAULT_BLOCK_SIZE - bytesRead)
@@ -136,11 +145,29 @@ object DiscConverter {
                         if (compressedSize >= DEFAULT_BLOCK_SIZE) {
                             output.write(rawBuffer)
                             currentOffset += DEFAULT_BLOCK_SIZE
-                            indexTable[i + 1] = (currentOffset or 0x80000000.toInt())
+                            
+                            val rem = currentOffset % align
+                            if (rem != 0L) {
+                                val pad = align - rem
+                                output.write(ByteArray(pad.toInt()))
+                                currentOffset += pad
+                            }
+                            
+                            // FIX: Flag the current block as uncompressed natively
+                            indexTable[i] = indexTable[i] or 0x80000000.toInt()
+                            indexTable[i + 1] = (currentOffset shr indexShift).toInt()
                         } else {
                             output.write(compressBuffer, 0, compressedSize)
                             currentOffset += compressedSize
-                            indexTable[i + 1] = currentOffset
+                            
+                            val rem = currentOffset % align
+                            if (rem != 0L) {
+                                val pad = align - rem
+                                output.write(ByteArray(pad.toInt()))
+                                currentOffset += pad
+                            }
+
+                            indexTable[i + 1] = (currentOffset shr indexShift).toInt()
                         }
 
                         if (i % 1000 == 0 || i == totalBlocks - 1) {
@@ -159,8 +186,9 @@ object DiscConverter {
                     putInt(24)
                     putLong(totalBytes)
                     putInt(DEFAULT_BLOCK_SIZE)
-                    put(0.toByte())
-                    put(byteArrayOf(0, 0, 0))
+                    put(1.toByte())
+                    put(indexShift.toByte())
+                    putShort(0)
                 }.array()
 
                 channel.write(ByteBuffer.wrap(header))
@@ -187,8 +215,6 @@ object DiscConverter {
         contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { rawInput ->
             val input = DataInputStream(rawInput)
             val headerBuffer = ByteArray(24)
-            
-            // readFully guarantees we get exactly 24 bytes for the header
             input.readFully(headerBuffer)
 
             val header = ByteBuffer.wrap(headerBuffer).order(ByteOrder.LITTLE_ENDIAN)
@@ -202,14 +228,19 @@ object DiscConverter {
             header.getInt()
             val totalBytes = header.getLong()
             val blockSize = header.getInt()
+            header.get()
+            val indexShift = header.get().toInt()
+            header.getShort()
+
             val totalBlocks = ((totalBytes + blockSize - 1) / blockSize).toInt()
 
             val indexBytes = ByteArray((totalBlocks + 1) * 4)
-            // readFully guarantees we get the entire index table before continuing
             input.readFully(indexBytes)
             val indexTable = ByteBuffer.wrap(indexBytes).order(ByteOrder.LITTLE_ENDIAN).run {
                 IntArray(totalBlocks + 1) { getInt() }
             }
+
+            var currentReadPos = 24L + indexBytes.size
 
             contentResolver.openOutputStream(outputUri)?.buffered(65536)?.use { output ->
                 val inflater = Inflater()
@@ -219,14 +250,24 @@ object DiscConverter {
                     val nextRawOffset = indexTable[i + 1]
 
                     val isUncompressed = (rawOffset and 0x80000000.toInt()) != 0
-                    val offset = rawOffset and 0x7FFFFFFF
-                    val nextOffset = nextRawOffset and 0x7FFFFFFF
-                    val compressedLen = nextOffset - offset
+                    val offset = (rawOffset and 0x7FFFFFFF).toLong() shl indexShift
+                    val nextOffset = (nextRawOffset and 0x7FFFFFFF).toLong() shl indexShift
+                    val compressedLen = (nextOffset - offset).toInt()
+
+                    // Skip formatting pad adjustments
+                    if (offset > currentReadPos) {
+                        var skipAmt = (offset - currentReadPos).toInt()
+                        while (skipAmt > 0) {
+                            val s = input.skipBytes(skipAmt)
+                            if (s <= 0) break
+                            skipAmt -= s
+                        }
+                        currentReadPos = offset
+                    }
 
                     val blockData = ByteArray(compressedLen)
-                    // readFully PREVENTS the "incorrect header check" crash
-                    // by guaranteeing the block is fully loaded before handing it to the Inflater.
                     input.readFully(blockData)
+                    currentReadPos += compressedLen
 
                     if (isUncompressed) {
                         output.write(blockData)
