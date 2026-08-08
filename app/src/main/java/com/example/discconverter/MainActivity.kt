@@ -42,6 +42,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 
 class MainActivity : ComponentActivity() {
 
@@ -55,21 +56,35 @@ class MainActivity : ComponentActivity() {
             when (intent?.action) {
                 ConversionService.ACTION_CONVERSION_PROGRESS -> {
                     val progress = intent.getFloatExtra(ConversionService.EXTRA_PROGRESS, 0f)
+                    val fileName = intent.getStringExtra(ConversionService.EXTRA_FILE_NAME) ?: ""
+                    val fileIndex = intent.getIntExtra(ConversionService.EXTRA_BATCH_INDEX, 1)
+                    val totalFiles = intent.getIntExtra(ConversionService.EXTRA_BATCH_TOTAL, 1)
                     progressState.floatValue = progress
-                    statusMessageState.value = "Converting: ${(progress * 100).toInt()}%"
-                }
-                ConversionService.ACTION_CONVERSION_COMPLETE -> {
-                    isConvertingState.value = false
-                    progressState.floatValue = 1f
-                    statusMessageState.value = "Conversion completed successfully!"
-                    Toast.makeText(this@MainActivity, "Conversion Done!", Toast.LENGTH_SHORT).show()
+                    statusMessageState.value = if (totalFiles > 1) {
+                        "File $fileIndex of $totalFiles — $fileName: ${(progress * 100).toInt()}%"
+                    } else {
+                        "Converting: ${(progress * 100).toInt()}%"
+                    }
                 }
                 ConversionService.ACTION_CONVERSION_ERROR -> {
-                    isConvertingState.value = false
-                    isErrorState.value = true
                     val error = intent.getStringExtra(ConversionService.EXTRA_ERROR_MESSAGE) ?: "Unknown error"
+                    isErrorState.value = true
                     statusMessageState.value = "Error: $error"
-                    Toast.makeText(this@MainActivity, "Failed: $error", Toast.LENGTH_LONG).show()
+                    // Don't stop "converting" here - the service keeps going with the rest of the batch
+                }
+                ConversionService.ACTION_BATCH_COMPLETE -> {
+                    isConvertingState.value = false
+                    progressState.floatValue = 1f
+                    val success = intent.getIntExtra(ConversionService.EXTRA_SUCCESS_COUNT, 0)
+                    val failed = intent.getIntExtra(ConversionService.EXTRA_FAILED_COUNT, 0)
+                    val total = intent.getIntExtra(ConversionService.EXTRA_BATCH_TOTAL, success + failed)
+                    isErrorState.value = failed > 0
+                    statusMessageState.value = if (failed == 0) {
+                        "All $total file(s) converted successfully!"
+                    } else {
+                        "$success of $total converted — $failed failed"
+                    }
+                    Toast.makeText(this@MainActivity, statusMessageState.value, Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -80,7 +95,7 @@ class MainActivity : ComponentActivity() {
 
         val filter = IntentFilter().apply {
             addAction(ConversionService.ACTION_CONVERSION_PROGRESS)
-            addAction(ConversionService.ACTION_CONVERSION_COMPLETE)
+            addAction(ConversionService.ACTION_BATCH_COMPLETE)
             addAction(ConversionService.ACTION_CONVERSION_ERROR)
         }
 
@@ -102,8 +117,8 @@ class MainActivity : ComponentActivity() {
                         progress = progressState.floatValue,
                         statusMessage = statusMessageState.value,
                         isError = isErrorState.value,
-                        onStartConversion = { mode, inputUri, outputUri ->
-                            requestNotificationPermissionAndStart(mode, inputUri, outputUri)
+                        onStartConversion = { mode, inputUris, outputDirUri ->
+                            requestNotificationPermissionAndStart(mode, inputUris, outputDirUri)
                         }
                     )
                 }
@@ -116,24 +131,24 @@ class MainActivity : ComponentActivity() {
         unregisterReceiver(conversionReceiver)
     }
 
-    private fun requestNotificationPermissionAndStart(mode: ConversionType, inputUri: Uri, outputUri: Uri) {
+    private fun requestNotificationPermissionAndStart(mode: ConversionType, inputUris: List<Uri>, outputDirUri: Uri) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
             }
         }
-        startConversionService(mode, inputUri, outputUri)
+        startConversionService(mode, inputUris, outputDirUri)
     }
 
-    private fun startConversionService(mode: ConversionType, inputUri: Uri, outputUri: Uri) {
+    private fun startConversionService(mode: ConversionType, inputUris: List<Uri>, outputDirUri: Uri) {
         isConvertingState.value = true
         isErrorState.value = false
         progressState.floatValue = 0f
-        statusMessageState.value = "Starting conversion..."
+        statusMessageState.value = if (inputUris.size > 1) "Starting batch conversion..." else "Starting conversion..."
 
         val intent = Intent(this, ConversionService::class.java).apply {
-            putExtra(ConversionService.EXTRA_INPUT_URI, inputUri)
-            putExtra(ConversionService.EXTRA_OUTPUT_URI, outputUri)
+            putParcelableArrayListExtra(ConversionService.EXTRA_INPUT_URIS, ArrayList(inputUris))
+            putExtra(ConversionService.EXTRA_OUTPUT_DIR_URI, outputDirUri)
             putExtra(ConversionService.EXTRA_CONVERSION_TYPE, mode.name)
         }
         ContextCompat.startForegroundService(this, intent)
@@ -146,27 +161,43 @@ fun ConverterScreen(
     progress: Float,
     statusMessage: String,
     isError: Boolean,
-    onStartConversion: (ConversionType, Uri, Uri) -> Unit
+    onStartConversion: (ConversionType, List<Uri>, Uri) -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var selectedMode by remember { mutableStateOf(ConversionType.BIN_TO_ISO) }
-    var inputUri by remember { mutableStateOf<Uri?>(null) }
-    var inputFileName by remember { mutableStateOf("") }
+    var inputUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var inputFileNames by remember { mutableStateOf<List<String>>(emptyList()) }
+    var outputDirUri by remember { mutableStateOf<Uri?>(null) }
+    var outputDirName by remember { mutableStateOf("") }
 
-    val createDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("*/*")
-    ) { outputUri ->
-        if (outputUri != null && inputUri != null) {
-            onStartConversion(selectedMode, inputUri!!, outputUri)
+    val openDocumentsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            uris.forEach { uri ->
+                runCatching {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+            }
+            inputUris = uris
+            inputFileNames = uris.map { DiscConverter.getFileName(context, it) }
         }
     }
 
-    val openDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            inputUri = uri
-            inputFileName = DiscConverter.getFileName(context, uri)
+    val openDirectoryLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        if (treeUri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            outputDirUri = treeUri
+            outputDirName = DocumentFile.fromTreeUri(context, treeUri)?.name ?: "Selected folder"
         }
     }
 
@@ -233,7 +264,7 @@ fun ConverterScreen(
                     .padding(32.dp)
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    
+
                     // Custom Disc Art
                     Box(modifier = Modifier.size(120.dp), contentAlignment = Alignment.Center) {
                         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -248,7 +279,7 @@ fun ConverterScreen(
                     Spacer(modifier = Modifier.height(12.dp))
                     Text("Disc Converter", color = Color(0xFFF2F7FF), fontSize = 32.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text("Prepare your disc image for the format you need.", color = Color(0xFF9FB1D0), fontSize = 14.sp, textAlign = TextAlign.Center)
+                    Text("Convert one file or a whole batch at once.", color = Color(0xFF9FB1D0), fontSize = 14.sp, textAlign = TextAlign.Center)
 
                     Spacer(modifier = Modifier.height(36.dp))
 
@@ -280,15 +311,14 @@ fun ConverterScreen(
 
                     Spacer(modifier = Modifier.height(24.dp))
 
-                    // Select File Area
+                    // Select Files Area
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(16.dp))
                             .background(Color(0xC7071229))
-                            .clickable { openDocumentLauncher.launch(arrayOf("*/*")) }
+                            .clickable { openDocumentsLauncher.launch(arrayOf("*/*")) }
                     ) {
-                        // Dashed Border
                         Canvas(modifier = Modifier.matchParentSize()) {
                             drawRoundRect(
                                 color = Color(0x6183B0FF),
@@ -297,7 +327,7 @@ fun ConverterScreen(
                                 style = Stroke(width = 3f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f))
                             )
                         }
-                        
+
                         Row(
                             modifier = Modifier.padding(16.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -312,8 +342,67 @@ fun ConverterScreen(
                             }
                             Spacer(modifier = Modifier.width(16.dp))
                             Column(modifier = Modifier.weight(1f)) {
-                                Text("Select source file", color = Color(0xFFEAF2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                                Text(if (inputFileName.isEmpty()) "BIN, ISO, ZSO, CSO, or IMG" else inputFileName, color = Color(0xFF8EA3C6), fontSize = 12.sp, maxLines = 1)
+                                Text("Select source file(s)", color = Color(0xFFEAF2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                val subtitle = when {
+                                    inputFileNames.isEmpty() -> "BIN, ISO, ZSO, CSO, or IMG"
+                                    inputFileNames.size == 1 -> inputFileNames.first()
+                                    inputFileNames.size <= 3 -> inputFileNames.joinToString(", ")
+                                    else -> "${inputFileNames.take(2).joinToString(", ")} +${inputFileNames.size - 2} more"
+                                }
+                                Text(subtitle, color = Color(0xFF8EA3C6), fontSize = 12.sp, maxLines = 2)
+                            }
+                            if (inputFileNames.size > 1) {
+                                Box(
+                                    modifier = Modifier
+                                        .background(Color(0x29377FF3), RoundedCornerShape(10.dp))
+                                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text("${inputFileNames.size}", color = Color(0xFF9BC5FF), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+                            Icon(Icons.Default.KeyboardArrowRight, contentDescription = null, tint = Color(0xB3BFDBFE))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Select Output Folder Area
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(Color(0xC7071229))
+                            .clickable { openDirectoryLauncher.launch(null) }
+                    ) {
+                        Canvas(modifier = Modifier.matchParentSize()) {
+                            drawRoundRect(
+                                color = Color(0x6183B0FF),
+                                size = size,
+                                cornerRadius = CornerRadius(16.dp.toPx(), 16.dp.toPx()),
+                                style = Stroke(width = 3f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f))
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .background(Color(0x1A60A5FA), RoundedCornerShape(12.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Info, contentDescription = null, tint = Color(0xFF93C5FD), modifier = Modifier.size(20.dp))
+                            }
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Select output folder", color = Color(0xFFEAF2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                Text(
+                                    if (outputDirName.isEmpty()) "Converted files are saved here" else outputDirName,
+                                    color = Color(0xFF8EA3C6), fontSize = 12.sp, maxLines = 1
+                                )
                             }
                             Icon(Icons.Default.KeyboardArrowRight, contentDescription = null, tint = Color(0xB3BFDBFE))
                         }
@@ -322,29 +411,29 @@ fun ConverterScreen(
                     Spacer(modifier = Modifier.height(16.dp))
 
                     // Convert Button
+                    val canConvert = inputUris.isNotEmpty() && outputDirUri != null
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(12.dp))
                             .background(
-                                if (isConverting || inputUri == null) Brush.linearGradient(listOf(Color(0xFF3177EB).copy(alpha = 0.5f), Color(0xFF55A1FF).copy(alpha = 0.5f)))
+                                if (isConverting || !canConvert) Brush.linearGradient(listOf(Color(0xFF3177EB).copy(alpha = 0.5f), Color(0xFF55A1FF).copy(alpha = 0.5f)))
                                 else Brush.linearGradient(listOf(Color(0xFF3177EB), Color(0xFF55A1FF)))
                             )
-                            .clickable(enabled = !isConverting && inputUri != null) {
-                                val defaultOutput = DiscConverter.deriveOutputName(inputFileName, selectedMode)
-                                createDocumentLauncher.launch(defaultOutput)
+                            .clickable(enabled = !isConverting && canConvert) {
+                                onStartConversion(selectedMode, inputUris, outputDirUri!!)
                             }
                             .padding(vertical = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("Convert & Save As...", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        val label = if (inputUris.size > 1) "Convert ${inputUris.size} Files" else "Convert File"
+                        Text(label, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     }
 
                     // Progress Area
                     if (isConverting || progress > 0f || statusMessage.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(24.dp))
-                        
-                        // Track
+
                         Box(modifier = Modifier
                             .fillMaxWidth()
                             .height(4.dp)
@@ -354,9 +443,9 @@ fun ConverterScreen(
                                 .fillMaxHeight()
                                 .background(Brush.horizontalGradient(listOf(Color(0xFF357FF3), Color(0xFF8CC1FF))), CircleShape))
                         }
-                        
+
                         Spacer(modifier = Modifier.height(16.dp))
-                        
+
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier
                             .background(Color(0xA1020814), RoundedCornerShape(12.dp))
                             .border(1.dp, Color(0x2197B8EC), RoundedCornerShape(12.dp))
@@ -374,10 +463,9 @@ fun ConverterScreen(
                     }
                 }
             }
-            
+
             Spacer(modifier = Modifier.weight(1f))
-            
-            // Footer
+
             Text(
                 text = "Built for clean disc-image workflows",
                 color = Color(0xFF64799E),
