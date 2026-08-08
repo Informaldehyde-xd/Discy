@@ -99,7 +99,7 @@ object DiscConverter {
         context: Context,
         inputUri: Uri,
         outputUri: Uri,
-        compressionLevel: Int = 9,
+        compressionLevel: Int = 17,
         onProgress: (Float) -> Unit
     ) {
         val contentResolver = context.contentResolver
