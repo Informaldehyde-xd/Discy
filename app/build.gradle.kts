@@ -44,4 +44,5 @@ dependencies {
     implementation("androidx.compose.material3:material3")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
+    implementation("org.lz4:lz4-java:1.8.0")
 }
