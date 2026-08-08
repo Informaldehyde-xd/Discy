@@ -96,107 +96,121 @@ object DiscConverter {
      * compressionLevel: 1 = fast LZ4, >1 = LZ4 HC (mirrors ziso.py's -c flag).
      */
     suspend fun isoToZso(
-        context: Context,
-        inputUri: Uri,
-        outputUri: Uri,
-        compressionLevel: Int = 17,
-        onProgress: (Float) -> Unit
-    ) {
-        val contentResolver = context.contentResolver
-        val fileDescriptor = contentResolver.openFileDescriptor(inputUri, "r") ?: return
-        val totalBytes = fileDescriptor.statSize
-        fileDescriptor.close()
+    context: Context,
+    inputUri: Uri,
+    outputUri: Uri,
+    compressionLevel: Int = 17,
+    onProgress: (Float) -> Unit
+) {
+    val contentResolver = context.contentResolver
+    val fileDescriptor = contentResolver.openFileDescriptor(inputUri, "r") ?: return
+    val totalBytes = fileDescriptor.statSize
+    fileDescriptor.close()
 
-        // ziso.py: align = total_bytes // 2**31 (only non-zero for files > 2GB)
-        val indexShift = (totalBytes / 0x80000000L).toInt()
-        val align = 1 shl indexShift
+    val indexShift = (totalBytes / 0x80000000L).toInt()
+    val align = 1 shl indexShift
+    val totalBlocks = (totalBytes / DEFAULT_BLOCK_SIZE).toInt()
+    val indexTable = IntArray(totalBlocks + 1)
 
-        // ziso.py truncates any trailing partial block - PS2 ISOs are always sector-aligned
-        val totalBlocks = (totalBytes / DEFAULT_BLOCK_SIZE).toInt()
-        val indexTable = IntArray(totalBlocks + 1)
+    val compressor: LZ4Compressor =
+        if (compressionLevel > 1) lz4Factory.highCompressor(compressionLevel.coerceIn(1, 17))
+        else lz4Factory.fastCompressor()
 
-        val compressor: LZ4Compressor =
-            if (compressionLevel > 1) lz4Factory.highCompressor(compressionLevel.coerceIn(1, 17))
-            else lz4Factory.fastCompressor()
+    // Compress in parallel across all available cores, write sequentially after each batch
+    val parallelism = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val batchSize = parallelism * 32
 
-        var currentOffset = HEADER_SIZE.toLong() + (totalBlocks + 1) * 4L
+    var currentOffset = HEADER_SIZE.toLong() + (totalBlocks + 1) * 4L
 
-        val outFd = contentResolver.openFileDescriptor(outputUri, "rw")
-            ?: throw IllegalStateException("Cannot open output stream in read-write mode")
+    val outFd = contentResolver.openFileDescriptor(outputUri, "rw")
+        ?: throw IllegalStateException("Cannot open output stream in read-write mode")
 
-        outFd.use { pfd ->
-            FileOutputStream(pfd.fileDescriptor).use { output ->
-                // Reserve space for header + index table; filled in once real offsets are known
-                output.write(ByteArray(currentOffset.toInt()))
+    outFd.use { pfd ->
+        FileOutputStream(pfd.fileDescriptor).use { output ->
+            output.write(ByteArray(currentOffset.toInt()))
 
-                contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { input ->
-                    val rawBuffer = ByteArray(DEFAULT_BLOCK_SIZE)
-                    val compressBuffer = ByteArray(compressor.maxCompressedLength(DEFAULT_BLOCK_SIZE))
+            contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { input ->
+                var blocksProcessed = 0
 
-                    for (i in 0 until totalBlocks) {
+                while (blocksProcessed < totalBlocks) {
+                    val currentBatchSize = minOf(batchSize, totalBlocks - blocksProcessed)
+
+                    // Sequential read
+                    val rawBlocks = Array(currentBatchSize) { ByteArray(DEFAULT_BLOCK_SIZE) }
+                    for (b in 0 until currentBatchSize) {
                         var bytesRead = 0
                         while (bytesRead < DEFAULT_BLOCK_SIZE) {
-                            val r = input.read(rawBuffer, bytesRead, DEFAULT_BLOCK_SIZE - bytesRead)
+                            val r = input.read(rawBlocks[b], bytesRead, DEFAULT_BLOCK_SIZE - bytesRead)
                             if (r == -1) break
                             bytesRead += r
                         }
                         if (bytesRead < DEFAULT_BLOCK_SIZE) {
-                            rawBuffer.fill(0, bytesRead, DEFAULT_BLOCK_SIZE)
+                            rawBlocks[b].fill(0, bytesRead, DEFAULT_BLOCK_SIZE)
                         }
+                    }
 
-                        // ziso.py's set_align(): pad to the alignment boundary before each block
+                    // Parallel LZ4 HC compression - this is the step that actually benefits from cores
+                    val compressedBlocks: List<ByteArray> = coroutineScope {
+                        rawBlocks.map { raw ->
+                            async(Dispatchers.Default) {
+                                val destBuf = ByteArray(compressor.maxCompressedLength(DEFAULT_BLOCK_SIZE))
+                                val size = compressor.compress(raw, 0, DEFAULT_BLOCK_SIZE, destBuf, 0, destBuf.size)
+                                if (size * 100 / DEFAULT_BLOCK_SIZE >= COMPRESS_THRESHOLD_PERCENT) raw
+                                else destBuf.copyOf(size)
+                            }
+                        }.awaitAll()
+                    }
+
+                    // Sequential write - preserves order so offsets/index table stay correct
+                    for (b in 0 until currentBatchSize) {
+                        val i = blocksProcessed + b
                         val rem = (currentOffset % align).toInt()
                         if (rem != 0) {
                             val pad = align - rem
                             output.write(ByteArray(pad) { PAD_BYTE })
                             currentOffset += pad
                         }
-
                         indexTable[i] = (currentOffset shr indexShift).toInt()
 
-                        val compressedSize = compressor.compress(rawBuffer, 0, DEFAULT_BLOCK_SIZE, compressBuffer, 0, compressBuffer.size)
-
-                        if (compressedSize * 100 / DEFAULT_BLOCK_SIZE >= COMPRESS_THRESHOLD_PERCENT) {
-                            // Compression barely helped - store raw and flag the block as plain
-                            output.write(rawBuffer)
-                            currentOffset += DEFAULT_BLOCK_SIZE
+                        val data = compressedBlocks[b]
+                        val storedRaw = data === rawBlocks[b]
+                        output.write(data)
+                        currentOffset += data.size
+                        if (storedRaw) {
                             indexTable[i] = indexTable[i] or 0x80000000.toInt()
-                        } else {
-                            output.write(compressBuffer, 0, compressedSize)
-                            currentOffset += compressedSize
-                        }
-
-                        if (i % 1000 == 0 || i == totalBlocks - 1) {
-                            onProgress((i + 1).toFloat() / totalBlocks.toFloat())
                         }
                     }
+
+                    blocksProcessed += currentBatchSize
+                    onProgress(blocksProcessed.toFloat() / totalBlocks.toFloat())
                 }
-
-                indexTable[totalBlocks] = (currentOffset shr indexShift).toInt()
-
-                val channel = output.channel
-                channel.position(0)
-
-                val header = ByteBuffer.allocate(HEADER_SIZE).apply {
-                    order(ByteOrder.LITTLE_ENDIAN)
-                    put(ZSO_MAGIC)
-                    putInt(HEADER_SIZE)
-                    putLong(totalBytes)
-                    putInt(DEFAULT_BLOCK_SIZE)
-                    put(1.toByte())          // version
-                    put(indexShift.toByte()) // align
-                    putShort(0)
-                }.array()
-                channel.write(ByteBuffer.wrap(header))
-
-                val indexBytes = ByteBuffer.allocate((totalBlocks + 1) * 4).apply {
-                    order(ByteOrder.LITTLE_ENDIAN)
-                    indexTable.forEach { putInt(it) }
-                }.array()
-                channel.write(ByteBuffer.wrap(indexBytes))
             }
+
+            indexTable[totalBlocks] = (currentOffset shr indexShift).toInt()
+
+            val channel = output.channel
+            channel.position(0)
+
+            val header = ByteBuffer.allocate(HEADER_SIZE).apply {
+                order(ByteOrder.LITTLE_ENDIAN)
+                put(ZSO_MAGIC)
+                putInt(HEADER_SIZE)
+                putLong(totalBytes)
+                putInt(DEFAULT_BLOCK_SIZE)
+                put(1.toByte())
+                put(indexShift.toByte())
+                putShort(0)
+            }.array()
+            channel.write(ByteBuffer.wrap(header))
+
+            val indexBytes = ByteBuffer.allocate((totalBlocks + 1) * 4).apply {
+                order(ByteOrder.LITTLE_ENDIAN)
+                indexTable.forEach { putInt(it) }
+            }.array()
+            channel.write(ByteBuffer.wrap(indexBytes))
         }
-        onProgress(1f)
+    }
+    onProgress(1f)
     }
 
     /**
