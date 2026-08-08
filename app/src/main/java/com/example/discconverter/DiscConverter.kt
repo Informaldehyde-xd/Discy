@@ -3,13 +3,13 @@ package com.example.discconverter
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import net.jpountz.lz4.LZ4Compressor
+import net.jpountz.lz4.LZ4Factory
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.zip.Deflater
-import java.util.zip.Inflater
 
 enum class ConversionType {
     BIN_TO_ISO,
@@ -21,7 +21,14 @@ object DiscConverter {
 
     private const val DEFAULT_BLOCK_SIZE = 2048
     private const val BIN_SECTOR_SIZE = 2352
+    private const val HEADER_SIZE = 24
+    // Matches ziso.py's COMPRESS_THREHOLD: if compression saves less than 5%, store the block raw
+    private const val COMPRESS_THRESHOLD_PERCENT = 95
+    private val PAD_BYTE: Byte = 'X'.code.toByte() // matches ziso.py DEFAULT_PADDING
     private val ZSO_MAGIC = byteArrayOf('Z'.code.toByte(), 'S'.code.toByte(), 'O'.code.toByte(), 0x01)
+
+    // Pure-Java LZ4 implementation - no native libs to bundle, works out of the box on Android/CI
+    private val lz4Factory = LZ4Factory.safeInstance()
 
     fun getFileName(context: Context, uri: Uri): String {
         var name = "unknown_file"
@@ -61,11 +68,11 @@ object DiscConverter {
             val input = DataInputStream(rawInput)
             contentResolver.openOutputStream(outputUri)?.buffered(65536)?.use { output ->
                 val buffer = ByteArray(BIN_SECTOR_SIZE)
-                
+
                 try {
                     while (true) {
                         input.readFully(buffer)
-                        
+
                         val mode = buffer[15].toInt()
                         val offset = if (mode == 2) 24 else 16
                         output.write(buffer, offset, DEFAULT_BLOCK_SIZE)
@@ -83,11 +90,16 @@ object DiscConverter {
         onProgress(1f)
     }
 
+    /**
+     * ISO -> ZSO, ported to match ps2homebrew/Open-PS2-Loader's pc/ziso.py exactly:
+     * LZ4 block compression, floor-divided block count, and OPL's align/plain-flag scheme.
+     * compressionLevel: 1 = fast LZ4, >1 = LZ4 HC (mirrors ziso.py's -c flag).
+     */
     suspend fun isoToZso(
         context: Context,
         inputUri: Uri,
         outputUri: Uri,
-        compressionLevel: Int = 6,
+        compressionLevel: Int = 9,
         onProgress: (Float) -> Unit
     ) {
         val contentResolver = context.contentResolver
@@ -95,35 +107,31 @@ object DiscConverter {
         val totalBytes = fileDescriptor.statSize
         fileDescriptor.close()
 
-        // Calculate index shift for 2GB+ support
-        var indexShift = 0
-        while ((totalBytes shr indexShift) > 0x7FFFFFFF) {
-            indexShift++
-        }
+        // ziso.py: align = total_bytes // 2**31 (only non-zero for files > 2GB)
+        val indexShift = (totalBytes / 0x80000000L).toInt()
         val align = 1 shl indexShift
 
-        val totalBlocks = ((totalBytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE).toInt()
+        // ziso.py truncates any trailing partial block - PS2 ISOs are always sector-aligned
+        val totalBlocks = (totalBytes / DEFAULT_BLOCK_SIZE).toInt()
         val indexTable = IntArray(totalBlocks + 1)
-        
-        var currentOffset = 24L + (totalBlocks + 1) * 4L
-        if (currentOffset % align != 0L) {
-            currentOffset += align - (currentOffset % align)
-        }
 
-        indexTable[0] = (currentOffset shr indexShift).toInt()
+        val compressor: LZ4Compressor =
+            if (compressionLevel > 1) lz4Factory.highCompressor(compressionLevel.coerceIn(1, 17))
+            else lz4Factory.fastCompressor()
 
-        val deflater = Deflater(compressionLevel)
+        var currentOffset = HEADER_SIZE.toLong() + (totalBlocks + 1) * 4L
 
         val outFd = contentResolver.openFileDescriptor(outputUri, "rw")
             ?: throw IllegalStateException("Cannot open output stream in read-write mode")
 
         outFd.use { pfd ->
             FileOutputStream(pfd.fileDescriptor).use { output ->
+                // Reserve space for header + index table; filled in once real offsets are known
                 output.write(ByteArray(currentOffset.toInt()))
 
                 contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { input ->
                     val rawBuffer = ByteArray(DEFAULT_BLOCK_SIZE)
-                    val compressBuffer = ByteArray(DEFAULT_BLOCK_SIZE * 2)
+                    val compressBuffer = ByteArray(compressor.maxCompressedLength(DEFAULT_BLOCK_SIZE))
 
                     for (i in 0 until totalBlocks) {
                         var bytesRead = 0
@@ -132,42 +140,30 @@ object DiscConverter {
                             if (r == -1) break
                             bytesRead += r
                         }
-
                         if (bytesRead < DEFAULT_BLOCK_SIZE) {
                             rawBuffer.fill(0, bytesRead, DEFAULT_BLOCK_SIZE)
                         }
 
-                        deflater.setInput(rawBuffer)
-                        deflater.finish()
-                        val compressedSize = deflater.deflate(compressBuffer)
-                        deflater.reset()
+                        // ziso.py's set_align(): pad to the alignment boundary before each block
+                        val rem = (currentOffset % align).toInt()
+                        if (rem != 0) {
+                            val pad = align - rem
+                            output.write(ByteArray(pad) { PAD_BYTE })
+                            currentOffset += pad
+                        }
 
-                        if (compressedSize >= DEFAULT_BLOCK_SIZE) {
+                        indexTable[i] = (currentOffset shr indexShift).toInt()
+
+                        val compressedSize = compressor.compress(rawBuffer, 0, DEFAULT_BLOCK_SIZE, compressBuffer, 0, compressBuffer.size)
+
+                        if (compressedSize * 100 / DEFAULT_BLOCK_SIZE >= COMPRESS_THRESHOLD_PERCENT) {
+                            // Compression barely helped - store raw and flag the block as plain
                             output.write(rawBuffer)
                             currentOffset += DEFAULT_BLOCK_SIZE
-                            
-                            val rem = currentOffset % align
-                            if (rem != 0L) {
-                                val pad = align - rem
-                                output.write(ByteArray(pad.toInt()))
-                                currentOffset += pad
-                            }
-                            
-                            // FIX: Flag the current block as uncompressed natively
                             indexTable[i] = indexTable[i] or 0x80000000.toInt()
-                            indexTable[i + 1] = (currentOffset shr indexShift).toInt()
                         } else {
                             output.write(compressBuffer, 0, compressedSize)
                             currentOffset += compressedSize
-                            
-                            val rem = currentOffset % align
-                            if (rem != 0L) {
-                                val pad = align - rem
-                                output.write(ByteArray(pad.toInt()))
-                                currentOffset += pad
-                            }
-
-                            indexTable[i + 1] = (currentOffset shr indexShift).toInt()
                         }
 
                         if (i % 1000 == 0 || i == totalBlocks - 1) {
@@ -175,35 +171,37 @@ object DiscConverter {
                         }
                     }
                 }
-                deflater.end()
+
+                indexTable[totalBlocks] = (currentOffset shr indexShift).toInt()
 
                 val channel = output.channel
                 channel.position(0)
 
-                val header = ByteBuffer.allocate(24).apply {
+                val header = ByteBuffer.allocate(HEADER_SIZE).apply {
                     order(ByteOrder.LITTLE_ENDIAN)
                     put(ZSO_MAGIC)
-                    putInt(24)
+                    putInt(HEADER_SIZE)
                     putLong(totalBytes)
                     putInt(DEFAULT_BLOCK_SIZE)
-                    put(1.toByte())
-                    put(indexShift.toByte())
+                    put(1.toByte())          // version
+                    put(indexShift.toByte()) // align
                     putShort(0)
                 }.array()
-
                 channel.write(ByteBuffer.wrap(header))
 
                 val indexBytes = ByteBuffer.allocate((totalBlocks + 1) * 4).apply {
                     order(ByteOrder.LITTLE_ENDIAN)
                     indexTable.forEach { putInt(it) }
                 }.array()
-
                 channel.write(ByteBuffer.wrap(indexBytes))
             }
         }
         onProgress(1f)
     }
 
+    /**
+     * ZSO -> ISO, ported to match ziso.py's decompress_zso() exactly.
+     */
     suspend fun zsoToIso(
         context: Context,
         inputUri: Uri,
@@ -211,28 +209,32 @@ object DiscConverter {
         onProgress: (Float) -> Unit
     ) {
         val contentResolver = context.contentResolver
+        val decompressor = lz4Factory.safeDecompressor()
 
         contentResolver.openInputStream(inputUri)?.buffered(65536)?.use { rawInput ->
             val input = DataInputStream(rawInput)
-            val headerBuffer = ByteArray(24)
+            val headerBuffer = ByteArray(HEADER_SIZE)
             input.readFully(headerBuffer)
 
             val header = ByteBuffer.wrap(headerBuffer).order(ByteOrder.LITTLE_ENDIAN)
             val magic = ByteArray(4)
             header.get(magic)
-
             if (!magic.contentEquals(ZSO_MAGIC)) {
                 throw IllegalArgumentException("Invalid ZSO file header.")
             }
 
-            header.getInt()
+            val headerSize = header.getInt()
             val totalBytes = header.getLong()
             val blockSize = header.getInt()
-            header.get()
+            val version = header.get()
             val indexShift = header.get().toInt()
             header.getShort()
 
-            val totalBlocks = ((totalBytes + blockSize - 1) / blockSize).toInt()
+            if (headerSize != HEADER_SIZE || version.toInt() > 1) {
+                throw IllegalArgumentException("Unsupported ZSO version or header size.")
+            }
+
+            val totalBlocks = (totalBytes / blockSize).toInt()
 
             val indexBytes = ByteArray((totalBlocks + 1) * 4)
             input.readFully(indexBytes)
@@ -240,21 +242,29 @@ object DiscConverter {
                 IntArray(totalBlocks + 1) { getInt() }
             }
 
-            var currentReadPos = 24L + indexBytes.size
+            var currentReadPos = HEADER_SIZE.toLong() + indexBytes.size
 
             contentResolver.openOutputStream(outputUri)?.buffered(65536)?.use { output ->
-                val inflater = Inflater()
+                val decompressed = ByteArray(blockSize)
 
                 for (i in 0 until totalBlocks) {
-                    val rawOffset = indexTable[i]
-                    val nextRawOffset = indexTable[i + 1]
+                    val rawIndex = indexTable[i]
+                    val isUncompressed = (rawIndex and 0x80000000.toInt()) != 0
+                    val index = rawIndex and 0x7FFFFFFF
+                    val offset = index.toLong() shl indexShift
 
-                    val isUncompressed = (rawOffset and 0x80000000.toInt()) != 0
-                    val offset = (rawOffset and 0x7FFFFFFF).toLong() shl indexShift
-                    val nextOffset = (nextRawOffset and 0x7FFFFFFF).toLong() shl indexShift
-                    val compressedLen = (nextOffset - offset).toInt()
+                    // Plain blocks always read exactly blockSize; compressed blocks use the index diff
+                    val readSize: Int = if (isUncompressed) {
+                        blockSize
+                    } else {
+                        val index2 = indexTable[i + 1] and 0x7FFFFFFF
+                        if (i == totalBlocks - 1) {
+                            (totalBytes - offset).toInt()
+                        } else {
+                            ((index2 - index).toLong() shl indexShift).toInt()
+                        }
+                    }
 
-                    // Skip formatting pad adjustments
                     if (offset > currentReadPos) {
                         var skipAmt = (offset - currentReadPos).toInt()
                         while (skipAmt > 0) {
@@ -265,24 +275,18 @@ object DiscConverter {
                         currentReadPos = offset
                     }
 
-                    val blockData = ByteArray(compressedLen)
+                    val blockData = ByteArray(readSize)
                     input.readFully(blockData)
-                    currentReadPos += compressedLen
+                    currentReadPos += readSize
 
                     if (isUncompressed) {
                         output.write(blockData)
                     } else {
-                        inflater.setInput(blockData)
-                        val decompressed = ByteArray(blockSize)
-                        var decompressedSize = 0
-                        
-                        try {
-                            decompressedSize = inflater.inflate(decompressed)
+                        val decompressedSize = try {
+                            decompressor.decompress(blockData, 0, blockData.size, decompressed, 0, blockSize)
                         } catch (e: Exception) {
-                            throw RuntimeException("Decompression failed at block $i: ${e.message}", e)
+                            throw RuntimeException("LZ4 decompression failed at block $i: ${e.message}", e)
                         }
-                        
-                        inflater.reset()
                         output.write(decompressed, 0, decompressedSize)
                     }
 
@@ -290,7 +294,6 @@ object DiscConverter {
                         onProgress((i + 1).toFloat() / totalBlocks.toFloat())
                     }
                 }
-                inflater.end()
             }
         }
         onProgress(1f)
