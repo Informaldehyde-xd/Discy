@@ -3,6 +3,10 @@ package com.example.discconverter
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import net.jpountz.lz4.LZ4Compressor
 import net.jpountz.lz4.LZ4Factory
 import java.io.DataInputStream
