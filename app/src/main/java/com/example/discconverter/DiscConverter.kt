@@ -29,8 +29,7 @@ object DiscConverter {
     // Matches ziso.py's COMPRESS_THREHOLD: if compression saves less than 5%, store the block raw
     private const val COMPRESS_THRESHOLD_PERCENT = 95
     private val PAD_BYTE: Byte = 'X'.code.toByte() // matches ziso.py DEFAULT_PADDING
-    private val ZSO_MAGIC = byteArrayOf('Z'.code.toByte(), 'S'.code.toByte(), 'O'.code.toByte(), 0x01)
-
+    private val ZSO_MAGIC = byteArrayOf('Z'.code.toByte(), 'I'.code.toByte(), 'S'.code.toByte(), 'O'.code.toByte())
     // Pure-Java LZ4 implementation - no native libs to bundle, works out of the box on Android/CI
     private val lz4Factory = LZ4Factory.safeInstance()
 
